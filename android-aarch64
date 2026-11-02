@@ -12,3 +12,9 @@ system = 'android'
 cpu_family = 'aarch64'
 cpu = 'armv8'
 endian = 'little'
+
+[built-in options]
+# 16 KB ELF segment alignment: required to load on Android 15+ devices running
+# 16 KB page kernels (older NDKs default to 4 KB), harmless on 4 KB devices.
+c_link_args = ['-Wl,-z,max-page-size=16384']
+cpp_link_args = ['-Wl,-z,max-page-size=16384']

@@ -1,0 +1,135 @@
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 8b51fa2..8785a39 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -324,6 +324,12 @@ kgsl_bo_init(struct tu_device *dev,
+ 
+    if (lazy_vma) {
+       result = kgsl_sparse_vma_map(dev, lazy_vma, bo, 0);
++      /* Unlike kgsl_bo_user_map(), kgsl_sparse_vma_map() doesn't release the
++       * BO when it fails, so it would leak both the KGSL allocation and the
++       * BO table slot.
++       */
++      if (result != VK_SUCCESS)
++         kgsl_bo_finish(dev, bo);
+    } else if (flags & TU_BO_ALLOC_REPLAYABLE) {
+       result = kgsl_bo_user_map(dev, bo, client_iova);
+    }
+@@ -528,8 +534,16 @@ kgsl_sparse_vma_init(struct tu_device *dev,
+       ret = safe_ioctl(dev->physical_device->local_fd,
+                        IOCTL_KGSL_GPUMEM_GET_INFO, &info);
+       if (ret) {
++         const int info_errno = errno;
++         struct kgsl_gpuobj_free free_req = { .id = req.id };
++
++         /* Release the VBO and its BO table slot, nothing else owns them. */
++         memset(bo, 0, sizeof(*bo));
++         safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUOBJ_FREE,
++                    &free_req);
++
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+-                          "GPUMEM_GET_INFO failed (%s)", strerror(errno));
++                          "GPUMEM_GET_INFO failed (%s)", strerror(info_errno));
+       }
+ 
+       bo->iova = info.gpuaddr;
+@@ -782,7 +796,7 @@ get_relative_ms(uint64_t abs_timeout_ns)
+  * which could lead to waiting substantially longer than requested
+  */
+ static VkResult
+-wait_timestamp_safe(int fd,
++wait_timestamp_safe(struct tu_device *dev,
+                     unsigned int context_id,
+                     unsigned int timestamp,
+                     uint64_t abs_timeout_ns)
+@@ -794,7 +808,7 @@ wait_timestamp_safe(int fd,
+    };
+ 
+    while (true) {
+-      int ret = ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
++      int ret = ioctl(dev->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
+ 
+       if (ret == -1 && (errno == EINTR || errno == EAGAIN)) {
+          int timeout_ms = get_relative_ms(abs_timeout_ns);
+@@ -805,8 +819,28 @@ wait_timestamp_safe(int fd,
+ 
+          wait.timeout = timeout_ms;
+       } else if (ret == -1) {
+-         assert(errno == ETIMEDOUT);
+-         return VK_TIMEOUT;
++         switch (errno) {
++         case ETIMEDOUT:
++            return VK_TIMEOUT;
++
++         /* Once a context is invalidated by a GPU fault/hang (EDEADLK) or is
++          * detached (ENOENT), or the GPU is gone (ENODEV/EIO), KGSL fails the
++          * wait with something other than ETIMEDOUT. Reporting that as
++          * VK_TIMEOUT made applications keep waiting on a fence that can
++          * never signal (and, with a non-finite timeout, spin on it), so
++          * report the device as lost instead.
++          */
++         case EDEADLK:
++         case ENOENT:
++         case ENODEV:
++         case EIO:
++            return vk_device_set_lost(&dev->vk,
++                                      "KGSL timestamp wait failed: %s",
++                                      strerror(errno));
++
++         default:
++            return VK_TIMEOUT;
++         }
+       } else {
+          return VK_SUCCESS;
+       }
+@@ -819,7 +853,7 @@ kgsl_queue_wait_fence(struct tu_queue *queue, uint32_t fence,
+ {
+    uint64_t abs_timeout_ns = os_time_get_nano() + timeout_ns;
+ 
+-   return wait_timestamp_safe(queue->device->fd, queue->msm_queue_id,
++   return wait_timestamp_safe(queue->device, queue->msm_queue_id,
+                               fence, abs_timeout_ns);
+ }
+ 
+@@ -868,7 +902,7 @@ kgsl_syncobj_wait(struct tu_device *device,
+       return VK_TIMEOUT;
+ 
+    case KGSL_SYNCOBJ_STATE_TS: {
+-      return wait_timestamp_safe(device->fd, s->queue->msm_queue_id,
++      return wait_timestamp_safe(device, s->queue->msm_queue_id,
+                                  s->timestamp, abs_timeout_ns);
+    }
+ 
+@@ -966,7 +1000,7 @@ kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs,
+    }
+ 
+    if (u_vector_length(&poll_fds) == 0) {
+-      result = wait_timestamp_safe(device->fd, queue->msm_queue_id,
++      result = wait_timestamp_safe(device, queue->msm_queue_id,
+                                    lowest_timestamp, MIN2(abs_timeout_ns, INT64_MAX));
+    } else {
+       int ret, i;
+@@ -1545,6 +1579,7 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
+    int ret;
+    uint32_t timestamp = 0;
+    uint64_t gpu_offset = 0;
++   int submit_errno = 0;
+ 
+    if (submit->bind_cmds.size == 0) {
+       struct kgsl_gpu_command req = {
+@@ -1651,11 +1686,14 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
+    }
+ #endif
+ 
++   /* Grab errno now, the cleanup below must not clobber it. */
++   submit_errno = errno;
++
+    kgsl_syncobj_destroy(&wait_sync);
+ 
+    if (ret) {
+       result = vk_device_set_lost(&queue->device->vk, "submit failed: %s\n",
+-                                  strerror(errno));
++                                  strerror(submit_errno));
+       goto fail_submit;
+    }
+ 
