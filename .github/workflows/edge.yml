@@ -27,12 +27,14 @@ jobs:
         patch -p1 -i ../mesa-implement-android_stub.patch
         patch -p1 -i ../mesa-android-include-all-vulkan-extension.patch
 
-        # best effort on mesa main: it moves fast, don't fail the build if this stops applying
-        if patch -p1 --dry-run -s -i ../mesa-tu-kgsl-stability.patch; then
-          patch -p1 -i ../mesa-tu-kgsl-stability.patch
-        else
-          echo "::warning::mesa-tu-kgsl-stability.patch does not apply to mesa main, skipping it"
-        fi
+        # best effort on mesa main: it moves fast, don't fail the build if a patch stops applying
+        for p in mesa-tu-kgsl-stability.patch mesa-tu-kgsl-wait-fixes.patch; do
+          if patch -p1 --dry-run -s -i ../$p; then
+            patch -p1 -i ../$p
+          else
+            echo "::warning::$p does not apply to mesa main, skipping it"
+          fi
+        done
 
 
         meson setup build-android --cross-file ./android-aarch64 \
@@ -54,10 +56,14 @@ jobs:
 
         zip -9 mesa-turnip-android-${{ env.mesa-version }}.zip libvulkan_freedreno.so
 
+        sh ../pack-adrenotools.sh . "edge-$(git rev-parse --short HEAD)" libvulkan_freedreno.so mesa-turnip-adrenotools-${{ env.mesa-version }}.zip
+
     - name: release
       uses: softprops/action-gh-release@v3
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         tag_name: ${{ env.mesa-version }}
         name: mesa turnip driver for android ${{ env.mesa-version }}
-        files: mesa/mesa-turnip-android-${{ env.mesa-version }}.zip
+        files: |
+          mesa/mesa-turnip-android-${{ env.mesa-version }}.zip
+          mesa/mesa-turnip-adrenotools-${{ env.mesa-version }}.zip

@@ -1,0 +1,139 @@
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 8b51fa2..49982a9 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -782,22 +782,49 @@ get_relative_ms(uint64_t abs_timeout_ns)
+  * which could lead to waiting substantially longer than requested
+  */
+ static VkResult
+-wait_timestamp_safe(int fd,
++wait_timestamp_safe(struct tu_device *dev,
+                     unsigned int context_id,
+                     unsigned int timestamp,
+                     uint64_t abs_timeout_ns)
+ {
++   uint32_t timeout_ms = get_relative_ms(abs_timeout_ns);
++
++   /* The kernel treats a timeout of 0 as "wait forever" (see
++    * adreno_drawctxt_wait()), the opposite of what a poll, or a deadline that
++    * is already due, asks for. vkGetFenceStatus() and the timeline semaphore
++    * emulation, which polls every pending point whenever a semaphore is
++    * queried, signaled or submitted to, would block until the GPU gets to the
++    * timestamp and serialize the CPU against it. Read the retired timestamp
++    * instead.
++    */
++   if (timeout_ms == 0) {
++      struct kgsl_cmdstream_readtimestamp_ctxtid req = {
++         .context_id = context_id,
++         .type = KGSL_TIMESTAMP_RETIRED,
++      };
++
++      if (safe_ioctl(dev->fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID,
++                     &req) == 0 && timestamp_cmp(req.timestamp, timestamp))
++         return VK_SUCCESS;
++
++      /* Not retired yet. A real wait fails once the context is dead, keep
++       * telling polls about that as well.
++       */
++      VkResult status = vk_device_check_status(&dev->vk);
++      return status != VK_SUCCESS ? status : VK_TIMEOUT;
++   }
++
+    struct kgsl_device_waittimestamp_ctxtid wait = {
+       .context_id = context_id,
+       .timestamp = timestamp,
+-      .timeout = get_relative_ms(abs_timeout_ns),
++      .timeout = timeout_ms,
+    };
+ 
+    while (true) {
+-      int ret = ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
++      int ret = ioctl(dev->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
+ 
+       if (ret == -1 && (errno == EINTR || errno == EAGAIN)) {
+-         int timeout_ms = get_relative_ms(abs_timeout_ns);
++         timeout_ms = get_relative_ms(abs_timeout_ns);
+ 
+          /* update timeout to consider time that has passed since the start */
+          if (timeout_ms == 0)
+@@ -805,8 +832,34 @@ wait_timestamp_safe(int fd,
+ 
+          wait.timeout = timeout_ms;
+       } else if (ret == -1) {
+-         assert(errno == ETIMEDOUT);
+-         return VK_TIMEOUT;
++         switch (errno) {
++         case ETIMEDOUT:
++            return VK_TIMEOUT;
++
++         /* The timestamp did expire, but the context faulted in the meantime.
++          * KGSL reports that once, to the first waiter that gets to see it.
++          * The reset status decides whether that makes the device lost.
++          */
++         case EPROTO:
++            return vk_device_check_status(&dev->vk);
++
++         /* Once a context is invalidated by a GPU fault/hang (EDEADLK) or is
++          * detached (ENOENT), or the GPU is gone (ENODEV/EIO), KGSL fails the
++          * wait with something other than ETIMEDOUT. Reporting that as
++          * VK_TIMEOUT made applications keep waiting on a fence that can
++          * never signal, so report the device as lost instead.
++          */
++         case EDEADLK:
++         case ENOENT:
++         case ENODEV:
++         case EIO:
++            return vk_device_set_lost(&dev->vk,
++                                      "KGSL timestamp wait failed: %s",
++                                      strerror(errno));
++
++         default:
++            return VK_TIMEOUT;
++         }
+       } else {
+          return VK_SUCCESS;
+       }
+@@ -819,7 +872,7 @@ kgsl_queue_wait_fence(struct tu_queue *queue, uint32_t fence,
+ {
+    uint64_t abs_timeout_ns = os_time_get_nano() + timeout_ns;
+ 
+-   return wait_timestamp_safe(queue->device->fd, queue->msm_queue_id,
++   return wait_timestamp_safe(queue->device, queue->msm_queue_id,
+                               fence, abs_timeout_ns);
+ }
+ 
+@@ -868,7 +921,7 @@ kgsl_syncobj_wait(struct tu_device *device,
+       return VK_TIMEOUT;
+ 
+    case KGSL_SYNCOBJ_STATE_TS: {
+-      return wait_timestamp_safe(device->fd, s->queue->msm_queue_id,
++      return wait_timestamp_safe(device, s->queue->msm_queue_id,
+                                  s->timestamp, abs_timeout_ns);
+    }
+ 
+@@ -944,10 +997,12 @@ kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs,
+       /* TSs could be merged by finding the one with the lowest timestamp */
+       bool first_ts = true;
+       kgsl_syncobj_foreach_state(syncobjs, KGSL_SYNCOBJ_STATE_TS) {
+-         if (first_ts || timestamp_cmp(sync->timestamp, lowest_timestamp)) {
+-            first_ts = false;
+-            lowest_timestamp = sync->timestamp;
+-         }
++         /* any of them is enough, so it is the earliest one to retire that
++          * has to be waited for (not the latest one)
++          */
++         lowest_timestamp = first_ts ? sync->timestamp :
++                            min_ts(lowest_timestamp, sync->timestamp);
++         first_ts = false;
+       }
+ 
+       if (num_fds) {
+@@ -966,7 +1021,7 @@ kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs,
+    }
+ 
+    if (u_vector_length(&poll_fds) == 0) {
+-      result = wait_timestamp_safe(device->fd, queue->msm_queue_id,
++      result = wait_timestamp_safe(device, queue->msm_queue_id,
+                                    lowest_timestamp, MIN2(abs_timeout_ns, INT64_MAX));
+    } else {
+       int ret, i;

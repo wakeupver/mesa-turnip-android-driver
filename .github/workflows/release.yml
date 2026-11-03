@@ -28,6 +28,7 @@ jobs:
         patch -p1 -i ../mesa-implement-android_stub.patch
         patch -p1 -i ../mesa-android-include-all-vulkan-extension.patch
         patch -p1 -i ../mesa-tu-kgsl-stability.patch
+        patch -p1 -i ../mesa-tu-kgsl-wait-fixes.patch
 
         meson setup build-android --cross-file ./android-aarch64 \
             -Dbuildtype=release \
@@ -48,10 +49,14 @@ jobs:
 
         zip -9 mesa-turnip-android-${{ env.mesa-version }}.zip libvulkan_freedreno.so
 
+        sh ../pack-adrenotools.sh . ${{ env.mesa-version }} libvulkan_freedreno.so mesa-turnip-adrenotools-${{ env.mesa-version }}.zip
+
     - name: release
       uses: softprops/action-gh-release@v3
       with:
-        token: ${{ secrets.TOKEN }}
+        token: ${{ secrets.GITHUB_TOKEN }}
         tag_name: ${{ env.mesa-version }}
         name: mesa turnip driver for android ${{ env.mesa-version }}
-        files: mesa-${{ env.mesa-version }}/mesa-turnip-android-${{ env.mesa-version }}.zip
+        files: |
+          mesa-${{ env.mesa-version }}/mesa-turnip-android-${{ env.mesa-version }}.zip
+          mesa-${{ env.mesa-version }}/mesa-turnip-adrenotools-${{ env.mesa-version }}.zip
